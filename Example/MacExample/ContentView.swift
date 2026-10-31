@@ -1,5 +1,6 @@
 import SwiftUI
 import RealityKit
+import UniformTypeIdentifiers
 internal import VRMRealityKit
 internal import VRMKit
 
@@ -8,6 +9,12 @@ struct ContentView: View {
     @State private var selectedExpression: ExpressionKey = .preset(.neutral)
     @State private var expressions: [ExpressionInfo] = []
     @State private var isMToonEnabled = true
+    /// A VRM the user opened (or named with `-VRMPath` at launch), shown in place of the bundled model.
+    @State private var customURL: URL? = UserDefaults.standard.string(forKey: "VRMPath").map { URL(fileURLWithPath: $0) }
+    @State private var isImporterPresented = false
+    @State private var isAnimationImporterPresented = false
+    /// A VRMA the user opened; it replaces the walk cycle, and `RendererView` plays it.
+    @State private var animationURL: URL?
 
     var body: some View {
         VStack {
@@ -20,6 +27,10 @@ struct ContentView: View {
                     Label("Model", systemImage: "figure.stand")
                 }
                 .pickerStyle(.segmented)
+                .onChange(of: selectedModel) { _, _ in customURL = nil }
+
+                Button("Open VRM…", systemImage: "folder") { isImporterPresented = true }
+                Button("Open VRMA…", systemImage: "figure.walk.motion") { isAnimationImporterPresented = true }
 
                 Picker(selection: $selectedExpression) {
                     ForEach(expressions, id: \.key) { expression in
@@ -37,24 +48,34 @@ struct ContentView: View {
             .padding([.top, .horizontal])
 
             RendererView(selectedModel: selectedModel,
+                         customURL: customURL,
+                         animationURL: animationURL,
                          selectedExpression: selectedExpression,
                          isMToonEnabled: isMToonEnabled,
                          expressions: $expressions)
         }
         .frame(minWidth: 800, minHeight: 600)
+        .fileImporter(isPresented: $isImporterPresented, allowedContentTypes: [.data]) { result in
+            if case .success(let url) = result { customURL = url }
+        }
+        .fileImporter(isPresented: $isAnimationImporterPresented, allowedContentTypes: [.data]) { result in
+            if case .success(let url) = result { animationURL = url }
+        }
     }
 }
 
 private struct RendererView: View {
     @State private var viewModel = ContentViewModel()
     let selectedModel: MacExampleModel
+    let customURL: URL?
+    let animationURL: URL?
     let selectedExpression: ExpressionKey
     let isMToonEnabled: Bool
     /// A binding so the expression picker above can show the names the loaded model gives.
     @Binding var expressions: [ExpressionInfo]
 
     private var loadConfiguration: LoadConfiguration {
-        LoadConfiguration(model: selectedModel, isMToonEnabled: isMToonEnabled)
+        LoadConfiguration(model: selectedModel, customURL: customURL, isMToonEnabled: isMToonEnabled)
     }
 
     var body: some View {
@@ -63,11 +84,24 @@ private struct RendererView: View {
         }
         .background(Color.black)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Dragging turns the camera around the model; pinching or scrolling moves it in and out.
+        .gesture(DragGesture()
+            .onChanged { value in
+                viewModel.orbit(by: value.translation)
+            }
+            .onEnded { _ in viewModel.endOrbit() })
+        .gesture(MagnifyGesture()
+            .onChanged { value in viewModel.zoom(by: Float(value.magnification)) }
+            .onEnded { _ in viewModel.endZoom() })
         .task(id: loadConfiguration) {
             await viewModel.loadEntity(model: selectedModel,
+                                       customURL: customURL,
                                        expression: selectedExpression,
                                        isMToonEnabled: isMToonEnabled)
             expressions = viewModel.availableExpressions
+        }
+        .onChange(of: animationURL) { _, url in
+            if let url { viewModel.playVRMA(at: url) }
         }
         .onChange(of: selectedExpression) { _, expression in
             viewModel.setExpression(expression)
@@ -92,6 +126,7 @@ private struct RendererView: View {
 
 private struct LoadConfiguration: Hashable {
     let model: MacExampleModel
+    let customURL: URL?
     let isMToonEnabled: Bool
 }
 
@@ -117,8 +152,12 @@ final class ContentViewModel {
     private var orbitDistance: Float = 2
     private var orbitTarget = SIMD3<Float>(0, 0.8, 0)
     /// A three-quarter view from slightly above, which the iOS example shares.
-    private let orbitYaw: Float = -35 * .pi / 180
-    private let orbitPitch: Float = 21.5 * .pi / 180
+    private var orbitYaw: Float = -35 * .pi / 180
+    private var orbitPitch: Float = 21.5 * .pi / 180
+    private var dragStartYaw: Float?
+    private var dragStartPitch: Float = 0
+    private var zoomStartDistance: Float?
+    private var framedDistance: Float = 2
     var isVRMAPlaying: Bool { vrmaController != nil }
     private var vrmaAnimation: VRMAnimation?
     private var vrmaController: GLTFAnimationPlaybackController?
@@ -144,6 +183,7 @@ final class ContentViewModel {
 
     func loadEntity(
         model: MacExampleModel,
+        customURL: URL?,
         expression: ExpressionKey,
         isMToonEnabled: Bool
     ) async {
@@ -153,12 +193,24 @@ final class ContentViewModel {
         do {
             errorMessage = nil
 
-            let loader = try VRMEntityLoader(named: model.rawValue,
-                                             shaders: isMToonEnabled ? GLTFEntityLoader.defaultShaders : [])
+            let shaders = isMToonEnabled ? GLTFEntityLoader.defaultShaders : []
+            let loader: VRMEntityLoader
+            if let customURL {
+                // The file importer's URL is outside the sandbox until it is opened this way.
+                let isScoped = customURL.startAccessingSecurityScopedResource()
+                defer { if isScoped { customURL.stopAccessingSecurityScopedResource() } }
+                loader = try VRMEntityLoader(withURL: customURL, shaders: shaders)
+            } else {
+                loader = try VRMEntityLoader(named: model.rawValue, shaders: shaders)
+            }
             let nextVRMEntity = try await loader.loadEntity()
 
             nextVRMEntity.transform.translation = SIMD3<Float>(0, -1, 0)
-            nextVRMEntity.transform.rotation = simd_quatf(angle: model.initialRotation, axis: SIMD3<Float>(0, 1, 0))
+            // A file's own version says which way it faces; the bundled ones are known.
+            let turn: Float = customURL != nil
+                ? (nextVRMEntity.vrm.forwardDirection.z > 0 ? .pi : 0)
+                : model.initialRotation
+            nextVRMEntity.transform.rotation = simd_quatf(angle: turn, axis: SIMD3<Float>(0, 1, 0))
             nextVRMEntity.setMToonLightDirection(MacExampleLighting.towardLight)
             setUpCamera()
             setUpLight()
@@ -201,6 +253,22 @@ final class ContentViewModel {
             self.vrmaController = nil
         } else {
             startVRMAPlayback()
+        }
+    }
+
+    /// Swaps the animation for the VRMA at `url` and plays it from the start.
+    func playVRMA(at url: URL) {
+        let isScoped = url.startAccessingSecurityScopedResource()
+        defer { if isScoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            vrmaAnimation = try VRMAnimation(withURL: url)
+            vrmaController?.stop()
+            vrmaController = nil
+            errorMessage = nil
+            startVRMAPlayback()
+        } catch {
+            errorMessage = error.localizedDescription
+            print("VRMA Load Error: \(error)")
         }
     }
 
@@ -262,7 +330,30 @@ final class ContentViewModel {
         // The camera has a 60° vertical field of view, so pulling back by the
         // model's largest extent frames the whole of it.
         orbitDistance = max(0.2, maxExtent)
+        framedDistance = orbitDistance
     }
+
+    func orbit(by translation: CGSize) {
+        if dragStartYaw == nil {
+            dragStartYaw = orbitYaw
+            dragStartPitch = orbitPitch
+        }
+        let radiansPerPoint: Float = 0.01
+        orbitYaw = (dragStartYaw ?? orbitYaw) - Float(translation.width) * radiansPerPoint
+        orbitPitch = min(1.4, max(-1.4, dragStartPitch + Float(translation.height) * radiansPerPoint))
+        updateCameraTransform()
+    }
+
+    func endOrbit() { dragStartYaw = nil }
+
+    func zoom(by magnification: Float) {
+        let start = zoomStartDistance ?? orbitDistance
+        zoomStartDistance = start
+        orbitDistance = min(framedDistance * 4, max(framedDistance * 0.15, start / max(magnification, 0.05)))
+        updateCameraTransform()
+    }
+
+    func endZoom() { zoomStartDistance = nil }
 
     private func updateCameraTransform() {
         guard let cameraEntity else { return }
