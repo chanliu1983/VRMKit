@@ -1,0 +1,15 @@
+{
+  "originHash" : "c1cff0724377bae4ec7e6fbe7c909a440d56502b3d13025e028b8863d50c86b4",
+  "pins" : [
+    {
+      "identity" : "swift-simd-compat",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/tattn/swift-simd-compat",
+      "state" : {
+        "revision" : "f1d3f322c47831eef56ffca29791d719575201ee",
+        "version" : "0.1.1"
+      }
+    }
+  ],
+  "version" : 3
+}
